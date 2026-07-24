@@ -31,9 +31,6 @@ else
     echo -e "Using active GCP Project ID: ${GREEN}${PROJECT_ID}${NC}"
 fi
 
-rm .gitignore
-rm .git 
-
 REGION="us-central1"
 SERVICE_NAME="vertex-openai-proxy"
 SA_NAME="vertex-admin-sa"
