@@ -22,8 +22,8 @@ Deploy directly to **Google Cloud Run** using the automated deployment script.
    ```
 
 ### Admin Login:  
-Email: admin@bestofmine.com
-Password: 1e669e86409c79ce
+Email: admin@bestofmine.com  
+Password: 1e669e86409c79ce  
 
 ### What `deploy.sh` automatically does for you:
 - Enables all necessary GCP APIs (`aiplatform`, `run`, `firestore`, `iam`, `cloudbuild`, `artifactregistry`).
