@@ -14,7 +14,7 @@ Deploy directly to **Google Cloud Run** using the automated deployment script.
 2. Clone this repository and navigate into the directory:
    ```bash
    git clone https://github.com/marifuli/vertex-ai-proxy.git
-   cd vertex-openai-proxy
+   cd vertex-ai-proxy
    ```
 3. Run the automated deployment script:
    ```bash
