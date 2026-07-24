@@ -53,7 +53,6 @@ const SAFETY_SETTINGS = [
     { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
     { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' }
 ];
-
 async function callGeminiAPI(body, isStream, model, location, userId) {
     const vertex = await getVertexCredentials(userId);
     const accessToken = vertex.accessToken;
@@ -62,6 +61,7 @@ async function callGeminiAPI(body, isStream, model, location, userId) {
     const mod = model || vertex.model || 'gemini-2.5-pro';
     const effectiveLoc = "global";
 
+    delete body.generationConfig.thinkingConfig;
     const action = isStream ? 'streamGenerateContent?alt=sse' : 'generateContent';
     const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${effectiveLoc}/publishers/google/models/${mod}:${action}`;
 
@@ -76,7 +76,6 @@ async function callGeminiAPI(body, isStream, model, location, userId) {
 
     return await response.json();
 }
-
 async function callGeminiAPIWithRetry(body, isStream, model, location, userId) {
     try {
         const vertex = await getVertexCredentials(userId);
@@ -87,6 +86,7 @@ async function callGeminiAPIWithRetry(body, isStream, model, location, userId) {
         const effectiveLoc = 'global';
 
         const action = isStream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+        delete body.generationConfig.thinkingConfig;
         const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${effectiveLoc}/publishers/google/models/${mod}:${action}`;
 
         const response = await fetch(url, {
@@ -475,7 +475,8 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
             const apiEndpoint = 'aiplatform.googleapis.com';
             const apiPath = `/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
 
-            const requestBody = baseRequestBody;
+            let requestBody = baseRequestBody;
+            delete requestBody.generationConfig.thinkingConfig;
             const postData = JSON.stringify(requestBody);
 
             const options = {
@@ -1070,13 +1071,21 @@ router.post('/responses', async (req, res) => {
             const model = vertex.model;
             const { contents, systemInstructionText, imageLoadError, inlinedImagesInPayload } = await openAiMessagesToGeminiContents(finalMessages);
             if (imageLoadError) return res.status(400).json({ error: imageLoadError });
+            const genConfigResp = {
+                temperature: temperature || 0.7,
+                maxOutputTokens: max_output_tokens || 32768
+            };
+            if (req.body.thinkingConfig) {
+                genConfigResp.thinkingConfig = req.body.thinkingConfig;
+            } else if (req.body.reasoning_effort) {
+                genConfigResp.thinkingConfig = { thinkingLevel: req.body.reasoning_effort };
+            } else if (model.includes('thinking') || model.includes('reasoning')) {
+                if (!inlinedImagesInPayload) genConfigResp.thinkingConfig = { thinkingLevel: "high" };
+            }
+
             const body = {
                 contents,
-                generationConfig: {
-                    temperature: temperature || 0.7,
-                    maxOutputTokens: max_output_tokens || 32768,
-                    thinkingConfig: (inlinedImagesInPayload ? undefined : { thinkingLevel: "high" })
-                },
+                generationConfig: genConfigResp,
                 safetySettings: SAFETY_SETTINGS
             };
             if (systemInstructionText) body.systemInstruction = { role: 'system', parts: [{ text: systemInstructionText }] };
