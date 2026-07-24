@@ -5,6 +5,7 @@
 # Service account keys (NEVER commit these!)
 *.json
 !package.json
+!package-lock.json
 !tsconfig.json
 
 # Node modules
