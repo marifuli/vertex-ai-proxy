@@ -6,7 +6,7 @@
 
 # Node modules
 node_modules/
-
+key.json
 # OS files
 .DS_Store
 Thumbs.db
