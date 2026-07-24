@@ -84,7 +84,7 @@
             </div>
 
         </div>
-
+        <div class="alert alert-success loading">Loading ...</div>
         <div class="table-responsive">
             <table class="table table-bordered align-middle bg-white">
 
@@ -191,7 +191,7 @@ $("#logoutBtn").click(function(){
 });
 
 function loadKeys(){
-
+    $('.loading').show()
     $.ajax({
 
         url:'/admin/api-keys',
@@ -239,7 +239,7 @@ Delete
             });
 
             $("#keysTable").html(html);
-
+            $('.loading').hide()
         }
 
     });
