@@ -86,8 +86,7 @@ done
 echo "Generating Service Account key.json..."
 gcloud iam service-accounts keys create "$KEY_FILE" \
     --iam-account="$SA_EMAIL" \
-    --project="$PROJECT_ID" \
-    --force
+    --project="$PROJECT_ID"
 
 echo -e "${GREEN}✓ Created and saved ${KEY_FILE}${NC}"
 
