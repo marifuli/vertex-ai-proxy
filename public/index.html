@@ -17,7 +17,7 @@
 
     <div id="loginCard" class="card mx-auto" style="max-width:420px;">
 
-        <div class="card-header">
+        <div class="card-header fw-bold">
             Admin Login
         </div>
 
@@ -39,7 +39,7 @@
 
         <div class="d-flex justify-content-between align-items-center mb-4">
 
-            <h3>API Keys</h3>
+            <h3 class="m-0">API Keys Dashboard</h3>
 
             <button class="btn btn-danger" id="logoutBtn">
                 Logout
@@ -51,7 +51,7 @@
 
             <div class="card-body">
 
-                <div class="row">
+                <div class="row g-2">
 
                     <div class="col-md-8">
                         <input id="keyName" class="form-control" placeholder="Key Name">
@@ -71,7 +71,7 @@
 
         <div id="newKeyBox" class="alert alert-success" style="display:none;">
 
-            <strong>Copy this key now.</strong>
+            <strong>Copy this key now. It won't be displayed again:</strong>
 
             <div class="input-group mt-2">
 
@@ -85,22 +85,27 @@
 
         </div>
 
-        <table class="table table-bordered bg-white">
+        <div class="table-responsive">
+            <table class="table table-bordered align-middle bg-white">
 
-            <thead>
+                <thead class="table-dark">
 
-            <tr>
-                <th>Name</th>
-                <th>Requests</th>
-                <th>Last Used</th>
-                <th></th>
-            </tr>
+                <tr>
+                    <th>Name</th>
+                    <th>Requests</th>
+                    <th>Prompt Tokens</th>
+                    <th>Completion Tokens</th>
+                    <th>Total Tokens</th>
+                    <th>Last Used</th>
+                    <th>Action</th>
+                </tr>
 
-            </thead>
+                </thead>
 
-            <tbody id="keysTable"></tbody>
+                <tbody id="keysTable"></tbody>
 
-        </table>
+            </table>
+        </div>
 
     </div>
 
@@ -199,19 +204,29 @@ function loadKeys(){
 
             keys.forEach(function(key){
 
+                const promptTokens = key.prompt_tokens || 0;
+                const completionTokens = key.completion_tokens || 0;
+                const totalTokens = promptTokens + completionTokens;
+
                 html+=`
 <tr>
 
-<td>${key.name}</td>
+<td class="fw-semibold">${key.name}</td>
 
-<td>${key.request_count}</td>
+<td><span class="badge bg-secondary">${key.request_count || 0}</span></td>
 
-<td>${key.last_used_at ?? 'Never'}</td>
+<td>${promptTokens.toLocaleString()}</td>
+
+<td>${completionTokens.toLocaleString()}</td>
+
+<td><span class="badge bg-primary fs-6">${totalTokens.toLocaleString()}</span></td>
+
+<td>${key.last_used_at ? new Date(key.last_used_at).toLocaleString() : 'Never'}</td>
 
 <td>
 
 <button
-class="btn btn-sm btn-danger deleteBtn"
+class="btn btn-sm btn-outline-danger deleteBtn"
 data-id="${key.id}">
 Delete
 </button>

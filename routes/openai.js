@@ -5,6 +5,7 @@ const https = require('https');
 const os = require('os');
 const apiKeyAuth = require('../middleware/apiKey');
 const { getVertexCredentials } = require('../lib/vertexAuth');
+const { recordUsage } = require('../lib/apiKeys');
 
 const router = express.Router();
 
@@ -510,6 +511,8 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 proxyRes.setEncoding('utf8');
 
                 let hasStreamedToolCall = false; // Tracks if we need to send 'tool_calls' as the stop reason
+                let streamPromptTokens = 0;
+                let streamCompletionTokens = 0;
 
                 proxyRes.on('data', (chunk) => {
                     dataBuffer += chunk;
@@ -536,6 +539,10 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
                         try {
                             const parsed = JSON.parse(jsonStr);
+                            if (parsed.usageMetadata) {
+                                if (parsed.usageMetadata.promptTokenCount) streamPromptTokens = parsed.usageMetadata.promptTokenCount;
+                                if (parsed.usageMetadata.candidatesTokenCount) streamCompletionTokens = parsed.usageMetadata.candidatesTokenCount;
+                            }
                             if (parsed.candidates && parsed.candidates.length > 0) {
                                 const parts = parsed.candidates[0]?.content?.parts || [];
                                 parts.forEach(part => {
@@ -603,12 +610,15 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 });
 
                 proxyRes.on('end', () => {
+                    if (req.apiKey && req.apiKey.id) {
+                        recordUsage(req.apiKey.id, streamPromptTokens, streamCompletionTokens).catch(() => {});
+                    }
                     // FIX: Final empty packet with correct stop sequence for coding IDEs
                     const finishChunkObj = {
                         id: `chatcmpl-${Date.now()}`,
                         object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
-                        model: model || MODEL_ID,
+                        model: model,
                         choices: [{
                             delta: {},
                             index: 0,
@@ -740,6 +750,14 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
             console.log(`[V1/CHAT] Received response: "${reply.substring(0, 50)}${reply.length > 50 ? '...' : ''}"`);
 
+            const usageMeta = response?.usageMetadata || (Array.isArray(response) && response[0]?.usageMetadata) || {};
+            const pTokens = usageMeta.promptTokenCount || 0;
+            const cTokens = usageMeta.candidatesTokenCount || 0;
+
+            if (req.apiKey && req.apiKey.id) {
+                recordUsage(req.apiKey.id, pTokens, cTokens).catch(() => {});
+            }
+
             res.json({
                 id: `chatcmpl-${Date.now()}`,
                 object: 'chat.completion',
@@ -755,9 +773,9 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                     finish_reason: toolCalls ? 'tool_calls' : 'stop'
                 }],
                 usage: {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0
+                    prompt_tokens: pTokens,
+                    completion_tokens: cTokens,
+                    total_tokens: pTokens + cTokens
                 }
             });
         }
