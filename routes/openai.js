@@ -60,7 +60,7 @@ async function callGeminiAPI(body, isStream, model, location, userId) {
     const projectId = vertex.projectId;
     const loc = location || vertex.location || 'us-central1';
     const mod = model || vertex.model || 'gemini-2.5-pro';
-    const effectiveLoc = loc === 'global' ? 'us-central1' : loc;
+    const effectiveLoc = "global";
 
     const action = isStream ? 'streamGenerateContent?alt=sse' : 'generateContent';
     const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${effectiveLoc}/publishers/google/models/${mod}:${action}`;
@@ -84,7 +84,7 @@ async function callGeminiAPIWithRetry(body, isStream, model, location, userId) {
         const projectId = vertex.projectId;
         const loc = location || vertex.location || 'us-central1';
         const mod = model || vertex.model || 'gemini-2.5-pro';
-        const effectiveLoc = loc === 'global' ? 'us-central1' : loc;
+        const effectiveLoc = 'global';
 
         const action = isStream ? 'streamGenerateContent?alt=sse' : 'generateContent';
         const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${effectiveLoc}/publishers/google/models/${mod}:${action}`;
@@ -470,7 +470,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
             const accessToken = vertex.accessToken;
             const projectId = vertex.projectId;
-            const location = vertex.location;
+            const location = "global";
             const model = vertex.model;
             const apiEndpoint = 'aiplatform.googleapis.com';
             const apiPath = `/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
@@ -965,8 +965,8 @@ router.post('/responses', async (req, res) => {
 
                     if (systemInstructionText) body.systemInstruction = { role: 'system', parts: [{ text: systemInstructionText }] };
 
-                    const EFFECTIVE_location = location === 'global' ? 'us-central1' : location;
-                    const apiPath = `/v1/projects/${projectId}/locations/${EFFECTIVE_location}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
+                    const EFFECTIVE_location = "global";
+                    const apiPath = `/v1/projects/${projectId}/locations/global/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
                     const postData = JSON.stringify(body);
 
                     proxyReq = https.request({

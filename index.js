@@ -1,8 +1,10 @@
+require('dotenv').config();
+
 const express = require('express');
+const path = require('path');
 
 const adminRoutes = require('./routes/admin');
 const openaiRoutes = require('./routes/openai');
-const path = require('path')
 const bootstrap = require('./lib/bootstrap');
 
 const app = express();
