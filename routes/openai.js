@@ -367,7 +367,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
         const { messages, model: requestedModel, temperature = 0.9, max_tokens, tools, tool_choice } = req.body;
 
         // Dynamic Routing
-        const model = resolveVertexModel(requestedModel);
+        let model = resolveVertexModel(requestedModel);
 
         // FIX: Respect client streaming request
         const stream = req.body.stream === true;
@@ -463,7 +463,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 parts: [{ text: systemInstructionText }]
             };
         }
-
         if (stream) {
             // ===== STREAMING RESPONSE =====
             const vertex = await getVertexCredentials(req.user.id);
@@ -471,11 +470,11 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
             const accessToken = vertex.accessToken;
             const projectId = vertex.projectId;
             const location = "global";
-            const model = vertex.model;
+            model = vertex.model || model;
             const apiEndpoint = 'aiplatform.googleapis.com';
             const apiPath = `/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
 
-            let requestBody = baseRequestBody;
+            let requestBody = { ...baseRequestBody };
             delete requestBody.generationConfig.thinkingConfig;
             const postData = JSON.stringify(requestBody);
 
@@ -491,6 +490,10 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 },
                 timeout: 60000
             };
+
+            // FIX 3: Generate ID and Timestamp ONCE for the entire stream
+            const streamId = `chatcmpl-${Date.now()}`;
+            const streamCreated = Math.floor(Date.now() / 1000);
 
             const proxyReq = https.request(options, (proxyRes) => {
                 if (proxyRes.statusCode !== 200) {
@@ -511,115 +514,136 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 let dataBuffer = '';
                 proxyRes.setEncoding('utf8');
 
-                let hasStreamedToolCall = false; // Tracks if we need to send 'tool_calls' as the stop reason
+                let hasStreamedToolCall = false; 
                 let streamPromptTokens = 0;
                 let streamCompletionTokens = 0;
 
+                // Helper function to process a single parsed Vertex AI JSON object
+                const processVertexChunk = (parsed) => {
+                    if (parsed.error) {
+                        console.error('[V1/STREAM] API returned error in stream:', parsed.error);
+                        const errChunk = {
+                            id: streamId, object: 'chat.completion.chunk', created: streamCreated,
+                            model: requestedModel || model,
+                            choices: [{ delta: { content: `Error: ${parsed.error.message}` }, index: 0, finish_reason: 'stop' }]
+                        };
+                        safeWrite(res, `data: ${JSON.stringify(errChunk)}\n\n`);
+                        return;
+                    }
+
+                    if (parsed.usageMetadata) {
+                        if (parsed.usageMetadata.promptTokenCount) streamPromptTokens = parsed.usageMetadata.promptTokenCount;
+                        if (parsed.usageMetadata.candidatesTokenCount) streamCompletionTokens = parsed.usageMetadata.candidatesTokenCount;
+                    }
+
+                    if (parsed.candidates && parsed.candidates.length > 0) {
+                        const parts = parsed.candidates[0]?.content?.parts || [];
+                        parts.forEach(part => {
+                            if (part.thought) return; // Skip internal reasoning
+
+                            if (part.text) {
+                                const chunkObj = {
+                                    id: streamId, object: 'chat.completion.chunk', created: streamCreated,
+                                    model: requestedModel || model,
+                                    choices: [{
+                                        delta: { content: part.text, role: 'assistant' },
+                                        index: 0, finish_reason: null
+                                    }]
+                                };
+                                safeWrite(res, `data: ${JSON.stringify(chunkObj)}\n\n`);
+                            }
+
+                            if (part.functionCall) {
+                                hasStreamedToolCall = true;
+                                const callId = 'call_' + Math.random().toString(36).substr(2, 9);
+
+                                toolCallData.set(callId, {
+                                    name: part.functionCall.name,
+                                    signature: part.thoughtSignature || part.thought_signature || null
+                                });
+
+                                const argsStr = typeof part.functionCall.args === 'string' 
+                                    ? part.functionCall.args 
+                                    : JSON.stringify(part.functionCall.args || {});
+
+                                const chunkObj = {
+                                    id: streamId, object: 'chat.completion.chunk', created: streamCreated,
+                                    model: requestedModel || model,
+                                    choices: [{
+                                        delta: {
+                                            role: 'assistant',
+                                            tool_calls: [{
+                                                index: 0, id: callId, type: 'function',
+                                                function: { name: part.functionCall.name, arguments: argsStr }
+                                            }]
+                                        },
+                                        index: 0, finish_reason: null
+                                    }]
+                                };
+                                safeWrite(res, `data: ${JSON.stringify(chunkObj)}\n\n`);
+                            }
+                        });
+                    }
+                };
+
                 proxyRes.on('data', (chunk) => {
                     dataBuffer += chunk;
+                    
+                    // FIX 1: Normalize all line endings to \n to prevent \r from breaking JSON.parse
+                    dataBuffer = dataBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-                    // SSE complete events are separated by '\n\n'
                     while (dataBuffer.includes('\n\n')) {
                         const eventEndIndex = dataBuffer.indexOf('\n\n');
-                        const rawEvent = dataBuffer.substring(0, eventEndIndex);
+                        let rawEvent = dataBuffer.substring(0, eventEndIndex).trim();
                         dataBuffer = dataBuffer.substring(eventEndIndex + 2);
 
-                        // Parse individual lines within the event
+                        if (!rawEvent) continue;
+
+                        // Extract JSON strictly from 'data:' lines
                         const lines = rawEvent.split('\n');
-                        let jsonStr = '';
+                        let jsonStr = lines
+                            .map(l => l.trim())
+                            .filter(l => l.startsWith('data:'))
+                            .map(l => l.substring(5).trim())
+                            .join('');
 
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                jsonStr += line.substring(6);
-                            } else if (line.startsWith('data:')) {
-                                jsonStr += line.substring(5);
-                            }
-                        }
-
-                        if (!jsonStr || jsonStr.trim() === '[DONE]') continue;
+                        if (!jsonStr || jsonStr === '[DONE]') continue;
 
                         try {
                             const parsed = JSON.parse(jsonStr);
-                            if (parsed.usageMetadata) {
-                                if (parsed.usageMetadata.promptTokenCount) streamPromptTokens = parsed.usageMetadata.promptTokenCount;
-                                if (parsed.usageMetadata.candidatesTokenCount) streamCompletionTokens = parsed.usageMetadata.candidatesTokenCount;
-                            }
-                            if (parsed.candidates && parsed.candidates.length > 0) {
-                                const parts = parsed.candidates[0]?.content?.parts || [];
-                                parts.forEach(part => {
-                                    // Skip thought parts (internal reasoning)
-                                    if (part.thought) {
-                                        console.log('[V1/STREAM] Thought:', part.text?.substring(0, 100) + '...');
-                                        return;
-                                    }
-                                    if (part.text) {
-                                        const chunkObj = {
-                                            id: `chatcmpl-${Date.now()}`,
-                                            object: 'chat.completion.chunk',
-                                            created: Math.floor(Date.now() / 1000),
-                                            model: requestedModel || model,
-                                            choices: [{
-                                                delta: { content: part.text, role: 'assistant' },
-                                                index: 0,
-                                                finish_reason: null
-                                            }]
-                                        };
-                                        safeWrite(res, `data: ${JSON.stringify(chunkObj)}\n\n`);
-                                    }
-
-                                    if (part.functionCall) {
-                                        hasStreamedToolCall = true;
-                                        const callId = 'call_' + Math.random().toString(36).substr(2, 9);
-
-                                        // FIX: Use correct cache mechanism
-                                        toolCallData.set(callId, {
-                                            name: part.functionCall.name,
-                                            signature: part.thoughtSignature || null
-                                        });
-
-                                        const chunkObj = {
-                                            id: `chatcmpl-${Date.now()}`,
-                                            object: 'chat.completion.chunk',
-                                            created: Math.floor(Date.now() / 1000),
-                                            model: model || MODEL_ID,
-                                            choices: [{
-                                                delta: {
-                                                    role: 'assistant',
-                                                    tool_calls: [{
-                                                        index: 0,
-                                                        id: callId,
-                                                        type: 'function',
-                                                        function: {
-                                                            name: part.functionCall.name,
-                                                            arguments: typeof part.functionCall.args === 'string' ? part.functionCall.args : JSON.stringify(part.functionCall.args || {})
-                                                        }
-                                                    }]
-                                                },
-                                                index: 0,
-                                                // FIX: Prevent infinite loop by setting finish reason to null during stream
-                                                finish_reason: null
-                                            }]
-                                        };
-                                        safeWrite(res, `data: ${JSON.stringify(chunkObj)}\n\n`);
-                                    }
-                                });
-                            }
+                            processVertexChunk(parsed);
                         } catch (e) {
-                            // If it fails to parse but event was separated by \n\n, try to recover.
+                            // FIX 1b: Log the error instead of swallowing it silently
+                            console.error('[V1/STREAM] Failed to parse SSE event:', e.message, 'Raw snippet:', rawEvent.substring(0, 150));
                         }
                     }
                 });
 
                 proxyRes.on('end', () => {
+                    // FIX 2: Fallback for when Vertex API returns a JSON Array instead of SSE
+                    if (dataBuffer.trim().length > 0) {
+                        console.warn('[V1/STREAM] Stream ended with unparsed data. Attempting JSON array fallback...');
+                        try {
+                            const parsedData = JSON.parse(dataBuffer);
+                            if (Array.isArray(parsedData)) {
+                                console.log('[V1/STREAM] Successfully processed JSON array fallback.');
+                                parsedData.forEach(item => processVertexChunk(item));
+                            } else if (parsedData && typeof parsedData === 'object') {
+                                processVertexChunk(parsedData);
+                            }
+                        } catch (e) {
+                            console.error('[V1/STREAM] Failed to parse buffer as JSON fallback:', e.message, 'Data:', dataBuffer.substring(0, 200));
+                        }
+                        dataBuffer = '';
+                    }
+
                     if (req.apiKey && req.apiKey.id) {
                         recordUsage(req.apiKey.id, streamPromptTokens, streamCompletionTokens).catch(() => {});
                     }
-                    // FIX: Final empty packet with correct stop sequence for coding IDEs
+                    
                     const finishChunkObj = {
-                        id: `chatcmpl-${Date.now()}`,
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: model,
+                        id: streamId, object: 'chat.completion.chunk', created: streamCreated,
+                        model: requestedModel || model,
                         choices: [{
                             delta: {},
                             index: 0,
@@ -639,8 +663,8 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
             proxyReq.write(postData);
             proxyReq.end();
-
-        } else {
+        }
+        else {
             // ===== NON-STREAMING RESPONSE =====
             const response = await callGeminiAPI(baseRequestBody, false, model, "global");
 
@@ -998,42 +1022,54 @@ router.post('/responses', async (req, res) => {
 
                         proxyRes.on('data', chunk => {
                             dataBuffer += chunk;
-                            let boundary = dataBuffer.lastIndexOf('\n');
-                            if (boundary !== -1) {
-                                const rawStr = dataBuffer.substring(0, boundary); dataBuffer = dataBuffer.substring(boundary + 1);
-                                rawStr.split('\n').filter(l => l.trim().startsWith('data: ')).forEach(line => {
-                                    try {
-                                        const parsed = JSON.parse(line.substring(6));
-                                        const parts = parsed.candidates?.[0]?.content?.parts || [];
-                                        parts.forEach(p => {
-                                            if (p.thought) return;
+                            while (dataBuffer.includes('\n\n')) {
+                                const eventEndIndex = dataBuffer.indexOf('\n\n');
+                                const rawEvent = dataBuffer.substring(0, eventEndIndex);
+                                dataBuffer = dataBuffer.substring(eventEndIndex + 2);
 
-                                            // Capture thinking signatures (support both snake_case from API and camelCase just in case)
-                                            const sig = p.thought_signature || p.thoughtSignature || null;
-                                            if (p.text) {
-                                                if (!hasStartedText) {
-                                                    hasStartedText = true;
-                                                    sendEvent('response.output_item.added', { type: 'response.output_item.added', output_index: 0, item: { id: msgId, type: 'message' } });
-                                                    outputIndexCounter++;
-                                                }
-                                                fullText += p.text;
-                                                sendEvent('response.output_text.delta', { type: 'response.output_text.delta', item_id: msgId, delta: p.text });
+                                const lines = rawEvent.split('\n');
+                                let jsonStr = '';
+                                for (const line of lines) {
+                                    if (line.startsWith(':')) continue;
+                                    if (line.startsWith('data: ')) jsonStr += line.substring(6);
+                                    else if (line.startsWith('data:')) jsonStr += line.substring(5);
+                                    else if (line.trim() !== '') jsonStr += line;
+                                }
+                                if (!jsonStr || jsonStr.trim() === '[DONE]') continue;
+
+                                try {
+                                    const parsed = JSON.parse(jsonStr);
+                                    const parts = parsed.candidates?.[0]?.content?.parts || [];
+                                    parts.forEach(p => {
+                                        if (p.thought) return;
+
+                                        // Capture thinking signatures (support both snake_case from API and camelCase just in case)
+                                        const sig = p.thought_signature || p.thoughtSignature || null;
+                                        if (p.text) {
+                                            if (!hasStartedText) {
+                                                hasStartedText = true;
+                                                sendEvent('response.output_item.added', { type: 'response.output_item.added', output_index: 0, item: { id: msgId, type: 'message' } });
+                                                outputIndexCounter++;
                                             }
+                                            fullText += p.text;
+                                            sendEvent('response.output_text.delta', { type: 'response.output_text.delta', item_id: msgId, delta: p.text });
+                                        }
 
-                                            if (p.functionCall) {
-                                                const callId = generateId('call_');
-                                                const args = typeof p.functionCall.args === 'string' ? p.functionCall.args : JSON.stringify(p.functionCall.args || {});
-                                                const currentIndex = outputIndexCounter++;
+                                        if (p.functionCall) {
+                                            const callId = generateId('call_');
+                                            const args = typeof p.functionCall.args === 'string' ? p.functionCall.args : JSON.stringify(p.functionCall.args || {});
+                                            const currentIndex = outputIndexCounter++;
 
-                                                toolCallData.set(callId, { name: p.functionCall.name, signature: sig });
+                                            toolCallData.set(callId, { name: p.functionCall.name, signature: sig });
 
-                                                sendEvent('response.output_item.added', { type: 'response.output_item.added', output_index: currentIndex, item: { id: callId, type: 'function_call', call_id: callId, name: p.functionCall.name, arguments: '' } });
-                                                sendEvent('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: callId, output_index: currentIndex, delta: args });
-                                                sendEvent('response.output_item.done', { type: 'response.output_item.done', output_index: currentIndex, item: { id: callId, type: 'function_call', call_id: callId, name: p.functionCall.name, arguments: args, status: 'completed' } });
-                                            }
-                                        });
-                                    } catch (e) { }
-                                });
+                                            sendEvent('response.output_item.added', { type: 'response.output_item.added', output_index: currentIndex, item: { id: callId, type: 'function_call', call_id: callId, name: p.functionCall.name, arguments: '' } });
+                                            sendEvent('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: callId, output_index: currentIndex, delta: args });
+                                            sendEvent('response.output_item.done', { type: 'response.output_item.done', output_index: currentIndex, item: { id: callId, type: 'function_call', call_id: callId, name: p.functionCall.name, arguments: args, status: 'completed' } });
+                                        }
+                                    });
+                                } catch (e) {
+                                    console.error('[V1/RESP] Failed to parse SSE event:', e.message, rawEvent);
+                                }
                             }
                         });
 
