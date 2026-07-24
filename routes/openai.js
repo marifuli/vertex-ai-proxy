@@ -641,7 +641,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
         } else {
             // ===== NON-STREAMING RESPONSE =====
-            const response = await callGeminiAPI(baseRequestBody, false, model, location);
+            const response = await callGeminiAPI(baseRequestBody, false, model, "global");
 
             if (response.error) {
                 console.error('[V1/CHAT] API Error:', response.error);
@@ -1090,7 +1090,7 @@ router.post('/responses', async (req, res) => {
                     }))
                 }];
             }
-            const rawResponseObj = await callGeminiAPIWithRetry(baseRequestBody, false, model, location);
+            const rawResponseObj = await callGeminiAPIWithRetry(body, false, model, "global", req.user?.id);
 
             if (rawResponseObj.statusCode !== 200) {
                 return res.status(rawResponseObj.statusCode).json({
