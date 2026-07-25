@@ -20,6 +20,18 @@ Deploy directly to **Google Cloud Run** using the automated deployment script.
    ```bash
    ./deploy.sh
    ```
+   
+### Update Steps:
+
+1. Open **Google Cloud Shell** in your Google Cloud Console.
+2. update this repository and navigate into the directory:
+   ```bash
+   cd vertex-ai-proxy && git pull
+   ```
+3. Run the automated deployment script:
+   ```bash
+   ./deploy.sh
+   ```
 
 ### Admin Login:  
 Email: admin@bestofmine.com  
