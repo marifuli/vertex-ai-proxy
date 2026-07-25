@@ -143,6 +143,23 @@ grant_role \
 "serviceAccount:$COMPUTE_SA" \
 "roles/storage.admin"
 
+echo "Granting Compute default SA permissions..."
+
+grant_role \
+"serviceAccount:$COMPUTE_SA" \
+"roles/cloudbuild.builds.builder"
+
+
+# Required for Cloud Run source upload bucket access
+grant_role \
+"serviceAccount:$COMPUTE_SA" \
+"roles/storage.objectViewer"
+
+
+# Required for Cloud Run build source bucket operations
+grant_role \
+"serviceAccount:$COMPUTE_SA" \
+"roles/storage.objectAdmin"
 
 
 echo "Cloud Run service agent..."
@@ -151,7 +168,49 @@ grant_role \
 "serviceAccount:$RUN_AGENT" \
 "roles/run.serviceAgent"
 
+echo -e "\n${BLUE}[3/6] Restoring IAM permissions${NC}"
 
+
+grant_role () {
+
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="$1" \
+        --role="$2" \
+        --quiet \
+        || true
+
+}
+
+
+echo "Cloud Build permissions..."
+
+grant_role \
+"serviceAccount:$CLOUDBUILD_SA" \
+"roles/cloudbuild.builds.builder"
+
+
+echo "Compute default service account permissions..."
+
+grant_role \
+"serviceAccount:$COMPUTE_SA" \
+"roles/cloudbuild.builds.builder"
+
+
+grant_role \
+"serviceAccount:$COMPUTE_SA" \
+"roles/storage.objectViewer"
+
+
+grant_role \
+"serviceAccount:$COMPUTE_SA" \
+"roles/storage.objectAdmin"
+
+
+echo "Cloud Run service agent..."
+
+grant_role \
+"serviceAccount:$RUN_AGENT" \
+"roles/run.serviceAgent"
 
 # ----------------------------------------------------
 # 6. Firestore
