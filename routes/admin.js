@@ -62,7 +62,7 @@ router.get('/api-keys', adminAuth, async (req, res) => {
                 name: key.name,
                 enabled: key.enabled,
                 created_at: key.created_at,
-                last_used_at: key.last_used_at,
+                last_used_at: key.last_used_at ? key.last_used_at : null,
                 request_count: key.request_count || 0,
                 prompt_tokens: key.prompt_tokens || 0,
                 completion_tokens: key.completion_tokens || 0
@@ -116,6 +116,49 @@ router.delete('/api-keys/:id', adminAuth, async (req, res) => {
         res.json({
             success: true
         });
+    } catch (err) {
+        console.error(err);
+
+        res.status(500).json({
+            error: 'Internal server error.'
+        });
+    }
+});
+
+/*
+|--------------------------------------------------------------------------
+| PUT /admin/password
+|--------------------------------------------------------------------------
+*/
+router.put('/password', adminAuth, async (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({
+                error: 'Current password and new password are required.'
+            });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({
+                error: 'New password must be at least 6 characters.'
+            });
+        }
+
+        const result = await auth.changePassword(
+            req.user.id,
+            currentPassword,
+            newPassword
+        );
+
+        if (!result.success) {
+            return res.status(400).json({
+                error: result.error
+            });
+        }
+
+        res.json({ success: true });
     } catch (err) {
         console.error(err);
 

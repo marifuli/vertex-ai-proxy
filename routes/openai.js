@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const os = require('os');
+const multer = require('multer'); // Added for file parser support
 const apiKeyAuth = require('../middleware/apiKey');
 const { getVertexCredentials } = require('../lib/vertexAuth');
 const { recordUsage } = require('../lib/apiKeys');
@@ -13,6 +14,14 @@ const DEBUG_DIR = path.join(os.tmpdir(), 'proxy_debug');
 if (!fs.existsSync(DEBUG_DIR)) {
     try { fs.mkdirSync(DEBUG_DIR, { recursive: true }); } catch {}
 }
+
+// Setup local cache path for uploaded files
+const FILES_DIR = path.join(os.tmpdir(), 'proxy_files');
+if (!fs.existsSync(FILES_DIR)) {
+    try { fs.mkdirSync(FILES_DIR, { recursive: true }); } catch {}
+}
+
+const upload = multer({ dest: path.join(os.tmpdir(), 'proxy_multer_uploads') });
 
 const toolCallData = new Map();
 
@@ -40,11 +49,10 @@ function smartTruncate(obj) {
 }
 
 function resolveVertexModel(requestedModel) {
-    if (!requestedModel) return process.env.GOOGLE_CLOUD_MODEL_ID || 'gemini-2.5-pro';
-    const lower = String(requestedModel).toLowerCase();
-    if (lower.includes('flash')) return 'gemini-2.0-flash';
-    if (lower.includes('1.5-pro')) return 'gemini-1.5-pro-002';
-    return process.env.GOOGLE_CLOUD_MODEL_ID || 'gemini-2.5-pro';
+    if (!requestedModel) return process.env.GOOGLE_CLOUD_MODEL_ID || 'gemini-3.5-flash';
+    let lower = String(requestedModel).toLowerCase();
+    lower = lower.replaceAll(' ', '-')
+    return lower || 'gemini-3.5-flash';
 }
 
 const SAFETY_SETTINGS = [
@@ -53,12 +61,13 @@ const SAFETY_SETTINGS = [
     { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
     { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' }
 ];
+
 async function callGeminiAPI(body, isStream, model, location, userId) {
     const vertex = await getVertexCredentials(userId);
     const accessToken = vertex.accessToken;
     const projectId = vertex.projectId;
     const loc = location || vertex.location || 'us-central1';
-    const mod = model || vertex.model || 'gemini-2.5-pro';
+    const mod = model || vertex.model || 'gemini-3.6-flash';
     const effectiveLoc = "global";
 
     delete body.generationConfig.thinkingConfig;
@@ -76,13 +85,14 @@ async function callGeminiAPI(body, isStream, model, location, userId) {
 
     return await response.json();
 }
+
 async function callGeminiAPIWithRetry(body, isStream, model, location, userId) {
     try {
         const vertex = await getVertexCredentials(userId);
         const accessToken = vertex.accessToken;
         const projectId = vertex.projectId;
         const loc = location || vertex.location || 'us-central1';
-        const mod = model || vertex.model || 'gemini-2.5-pro';
+        const mod = model || vertex.model || 'gemini-3.6-flash';
         const effectiveLoc = 'global';
 
         const action = isStream ? 'streamGenerateContent?alt=sse' : 'generateContent';
@@ -105,10 +115,6 @@ async function callGeminiAPIWithRetry(body, isStream, model, location, userId) {
     }
 }
 
-
-// ============================================================================
-// LEGACY CHAT ENDPOINT
-// ============================================================================
 
 // ============================================================================
 // OPENAI -> GEMINI MULTIMODAL (data URIs + fetchable http(s) image URLs)
@@ -151,7 +157,11 @@ function parseDataUriImage (url) {
     const mimeType = match[1].split(';')[0].trim() || 'image/png';
     const data = match[2].replace(/\s/g, '');
     if (!data) return null;
-    return normalizeInlineDataPart({ inlineData: { mimeType, data } });
+    // Keep raw non-image MIME formats (like application/pdf) or adjust image properties
+    if (mimeType.startsWith('image/')) {
+        return normalizeInlineDataPart({ inlineData: { mimeType, data } });
+    }
+    return { inlineData: { mimeType, data } };
 }
 
 function sniffImageMime (buf) {
@@ -159,6 +169,7 @@ function sniffImageMime (buf) {
     if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
     if (buf.length >= 6 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif';
     if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+    if (buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x4d && buf[3] === 0x46) return 'application/pdf';
     return null;
 }
 
@@ -217,10 +228,34 @@ async function resolveOpenAIImageUrl (url) {
 }
 
 /**
+ * Local Uploaded File Resolver
+ */
+function resolveLocalFileAsInlineData(fileId) {
+    if (!fileId || typeof fileId !== 'string' || !fileId.startsWith('file-')) return null;
+    try {
+        const metaPath = path.join(FILES_DIR, `${fileId}.json`);
+        const dataPath = path.join(FILES_DIR, `${fileId}.data`);
+        if (fs.existsSync(metaPath) && fs.existsSync(dataPath)) {
+            const metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+            const buf = fs.readFileSync(dataPath);
+            return {
+                inlineData: {
+                    mimeType: metadata.mimeType || 'application/octet-stream',
+                    data: buf.toString('base64')
+                }
+            };
+        }
+    } catch (e) {
+        console.warn(`[FILES] Failed to attach metadata file ${fileId}:`, e.message);
+    }
+    return null;
+}
+
+/**
  * GOD MODE: Disk Grabber
  */
 async function tryAttachLocalFilesByTextReference (text) {
-    const fileMatches = text.match(/@[a-zA-Z0-9_\-\.]+\.(png|jpg|jpeg|webp)/gi);
+    const fileMatches = text.match(/@[a-zA-Z0-9_\-\.]+\.(png|jpg|jpeg|webp|pdf|txt|csv)/gi);
     if (!fileMatches) return [];
 
     const attachedParts = [];
@@ -232,20 +267,39 @@ async function tryAttachLocalFilesByTextReference (text) {
             try {
                 const buf = fs.readFileSync(filePath);
                 const ext = path.extname(filename).toLowerCase();
-                let mimeType = 'image/png';
+                let mimeType = 'application/octet-stream';
                 if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
+                else if (ext === '.png') mimeType = 'image/png';
                 else if (ext === '.webp') mimeType = 'image/webp';
+                else if (ext === '.pdf') mimeType = 'application/pdf';
+                else if (ext === '.txt') mimeType = 'text/plain';
+                else if (ext === '.csv') mimeType = 'text/csv';
 
                 console.log(`[GOD_MODE] Auto-attached ${filename} from disk! Bypass successful.`);
-                attachedParts.push(normalizeInlineDataPart({
+                attachedParts.push({
                     inlineData: {
                         mimeType,
                         data: buf.toString('base64')
                     }
-                }));
+                });
             } catch (e) {
                 console.warn(`[GOD_MODE] Failed to read ${filename}:`, e.message);
             }
+        }
+    }
+    return attachedParts;
+}
+
+async function tryAttachLocalFilesByTextIDReference (text) {
+    const fileMatches = text.match(/file-[a-zA-Z0-9]{10,30}/gi);
+    if (!fileMatches) return [];
+
+    const attachedParts = [];
+    for (const fileId of fileMatches) {
+        const inline = resolveLocalFileAsInlineData(fileId);
+        if (inline) {
+            console.log(`[FILES] Detected file ID reference ${fileId} in query; auto-packing inline.`);
+            attachedParts.push(inline);
         }
     }
     return attachedParts;
@@ -275,6 +329,20 @@ async function openAiMessagesToGeminiContents (messages) {
                     inlinedImagesInPayload = true;
                 }
             }
+
+            // Extract OpenAI-style file block objects (e.g., from Assistants structure)
+            const fileBlocks = msg.content.filter(c => 
+                (c.type === 'file' && c.file_id) || 
+                (c.type === 'file_id' && c.file_id) || 
+                c.file_id
+            );
+            for (const fBlock of fileBlocks) {
+                const inlineFile = resolveLocalFileAsInlineData(fBlock.file_id || fBlock.file_id);
+                if (inlineFile) {
+                    imageParts.push(inlineFile);
+                    inlinedImagesInPayload = true;
+                }
+            }
         } else {
             msgText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content || '');
         }
@@ -290,9 +358,14 @@ async function openAiMessagesToGeminiContents (messages) {
             const parts = [];
             if (msgText) parts.push({ text: msgText });
             if (imageParts.length > 0) parts.push(...imageParts);
-            if (msgText && imageParts.length === 0) {
+            if (msgText) {
+                // Look for `@file.ext` patterns on disk
                 const diskParts = await tryAttachLocalFilesByTextReference(msgText);
                 if (diskParts.length > 0) { parts.push(...diskParts); inlinedImagesInPayload = true; }
+
+                // Look for direct references/uploads via ID (e.g. `file-xxxx` strings)
+                const uploadedParts = await tryAttachLocalFilesByTextIDReference(msgText);
+                if (uploadedParts.length > 0) { parts.push(...uploadedParts); inlinedImagesInPayload = true; }
             }
             if (parts.length === 0) parts.push({ text: ' ' });
 
@@ -305,11 +378,9 @@ async function openAiMessagesToGeminiContents (messages) {
                 for (const tc of msg.tool_calls) {
                     const funcName = tc.function.name;
                     const funcArgs = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments || '{}') : tc.function.arguments;
-                    // RESTORE: Look up the signature from our internal toolCallData Map
                     const stored = toolCallData.get(tc.id) || {};
                     const callPart = { functionCall: { name: funcName, args: funcArgs } };
 
-                    // MUST be snake_case for Vertex AI "Thinking" signatures
                     if (stored.signature) {
                         callPart.thought_signature = stored.signature;
                     }
@@ -319,7 +390,6 @@ async function openAiMessagesToGeminiContents (messages) {
             }
             if (parts.length > 0) contents.push({ role: 'model', parts });
         } else if (msg.role === 'tool') {
-            // FIX: Prevent creating stacked 'user' turns incorrectly
             let lastContent = contents[contents.length - 1];
             if (!lastContent || lastContent.role !== 'user') {
                 lastContent = { role: 'user', parts: [] };
@@ -343,11 +413,6 @@ async function openAiMessagesToGeminiContents (messages) {
                     response: parsedResponse
                 }
             });
-            // Ensure thoughtSignature is passed back if it exists for this turn sequence
-            if (stored.signature) {
-                // Gemini API expects the response to correspond to a turn. 
-                // We keep the signature in memory to help the next tool-leg if needed.
-            }
         }
     }
 
@@ -366,10 +431,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
     try {
         const { messages, model: requestedModel, temperature = 0.9, max_tokens, tools, tool_choice } = req.body;
 
-        // Dynamic Routing
         let model = resolveVertexModel(requestedModel);
-
-        // FIX: Respect client streaming request
         const stream = req.body.stream === true;
 
         if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -385,7 +447,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
         console.log(`[V1/CHAT] Stream: ${stream}, Messages: ${messages.length}, Tools: ${tools ? tools.length : 0}`);
 
-        // Write to system temp folder with Smart Truncation to prevent hangs and reboot loops
         const safeReq = smartTruncate(req.body);
         fs.writeFileSync(path.join(DEBUG_DIR, 'last_request.json'), JSON.stringify(safeReq, null, 2));
 
@@ -406,7 +467,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
             });
         }
 
-        // FIX: Utilize actual max_tokens from request
         const generationConfig = {
             temperature: temperature,
             topP: 1,
@@ -417,7 +477,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
         if (!inlinedImagesInPayload) {
             generationConfig.thinkingConfig = { thinkingLevel: "high" };
         } else {
-            console.log(`[V1/CHAT] Images in request: omitting thinkingConfig ...`);
+            console.log(`[V1/CHAT] Multimodal data loaded: omitting thinkingConfig ...`);
         }
 
         const baseRequestBody = {
@@ -431,9 +491,14 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 functionDeclarations: tools
                     .filter(t => t.type === 'function' && t.function)
                     .map(t => {
-                        const func = JSON.parse(JSON.stringify(t.function));
-                        if (func.parameters) {
-                            func.parameters = sanitizeSchema(func.parameters);
+                        // FIX: Explicitly parse and exclude OpenAI-specific properties (like 'strict')
+                        const baseFunc = t.function;
+                        const func = {
+                            name: baseFunc.name,
+                            description: baseFunc.description || ''
+                        };
+                        if (baseFunc.parameters) {
+                            func.parameters = sanitizeSchema(baseFunc.parameters);
                         }
                         return func;
                     })
@@ -464,13 +529,12 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
             };
         }
         if (stream) {
-            // ===== STREAMING RESPONSE =====
             const vertex = await getVertexCredentials(req.user.id);
 
             const accessToken = vertex.accessToken;
             const projectId = vertex.projectId;
             const location = "global";
-            model = vertex.model || model;
+            model = model || vertex.model;
             const apiEndpoint = 'aiplatform.googleapis.com';
             const apiPath = `/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
 
@@ -491,7 +555,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 timeout: 60000
             };
 
-            // FIX 3: Generate ID and Timestamp ONCE for the entire stream
             const streamId = `chatcmpl-${Date.now()}`;
             const streamCreated = Math.floor(Date.now() / 1000);
 
@@ -518,13 +581,12 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 let streamPromptTokens = 0;
                 let streamCompletionTokens = 0;
 
-                // Helper function to process a single parsed Vertex AI JSON object
                 const processVertexChunk = (parsed) => {
                     if (parsed.error) {
                         console.error('[V1/STREAM] API returned error in stream:', parsed.error);
                         const errChunk = {
                             id: streamId, object: 'chat.completion.chunk', created: streamCreated,
-                            model: requestedModel || model,
+                            model: model,
                             choices: [{ delta: { content: `Error: ${parsed.error.message}` }, index: 0, finish_reason: 'stop' }]
                         };
                         safeWrite(res, `data: ${JSON.stringify(errChunk)}\n\n`);
@@ -539,12 +601,12 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                     if (parsed.candidates && parsed.candidates.length > 0) {
                         const parts = parsed.candidates[0]?.content?.parts || [];
                         parts.forEach(part => {
-                            if (part.thought) return; // Skip internal reasoning
+                            if (part.thought) return;
 
                             if (part.text) {
                                 const chunkObj = {
                                     id: streamId, object: 'chat.completion.chunk', created: streamCreated,
-                                    model: requestedModel || model,
+                                    model: model,
                                     choices: [{
                                         delta: { content: part.text, role: 'assistant' },
                                         index: 0, finish_reason: null
@@ -568,7 +630,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
                                 const chunkObj = {
                                     id: streamId, object: 'chat.completion.chunk', created: streamCreated,
-                                    model: requestedModel || model,
+                                    model: model,
                                     choices: [{
                                         delta: {
                                             role: 'assistant',
@@ -588,8 +650,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
                 proxyRes.on('data', (chunk) => {
                     dataBuffer += chunk;
-                    
-                    // FIX 1: Normalize all line endings to \n to prevent \r from breaking JSON.parse
                     dataBuffer = dataBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
                     while (dataBuffer.includes('\n\n')) {
@@ -599,7 +659,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
                         if (!rawEvent) continue;
 
-                        // Extract JSON strictly from 'data:' lines
                         const lines = rawEvent.split('\n');
                         let jsonStr = lines
                             .map(l => l.trim())
@@ -613,14 +672,12 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                             const parsed = JSON.parse(jsonStr);
                             processVertexChunk(parsed);
                         } catch (e) {
-                            // FIX 1b: Log the error instead of swallowing it silently
                             console.error('[V1/STREAM] Failed to parse SSE event:', e.message, 'Raw snippet:', rawEvent.substring(0, 150));
                         }
                     }
                 });
 
                 proxyRes.on('end', () => {
-                    // FIX 2: Fallback for when Vertex API returns a JSON Array instead of SSE
                     if (dataBuffer.trim().length > 0) {
                         console.warn('[V1/STREAM] Stream ended with unparsed data. Attempting JSON array fallback...');
                         try {
@@ -643,7 +700,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                     
                     const finishChunkObj = {
                         id: streamId, object: 'chat.completion.chunk', created: streamCreated,
-                        model: requestedModel || model,
+                        model: model,
                         choices: [{
                             delta: {},
                             index: 0,
@@ -663,9 +720,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
 
             proxyReq.write(postData);
             proxyReq.end();
-        }
-        else {
-            // ===== NON-STREAMING RESPONSE =====
+        } else {
             const response = await callGeminiAPI(baseRequestBody, false, model, "global");
 
             if (response.error) {
@@ -679,19 +734,15 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 });
             }
 
-            // Handle response - could be array or object depending on streaming
             let reply = '';
             let toolCalls = null;
 
-            // Check if response is an array (streaming format returns array of chunks)
             if (Array.isArray(response)) {
-                // Streaming response - extract text from all chunks
                 response.forEach(chunk => {
                     if (chunk.candidates && chunk.candidates.length > 0) {
                         const candidate = chunk.candidates[0];
                         if (candidate.content && candidate.content.parts) {
                             candidate.content.parts.forEach(part => {
-                                // Skip thought parts for now (internal reasoning)
                                 if (part.thought) {
                                     console.log('[V1/CHAT] Thought:', part.text?.substring(0, 100) + '...');
                                     return;
@@ -700,7 +751,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                                     if (!toolCalls) toolCalls = [];
                                     const callId = 'call_' + Math.random().toString(36).substr(2, 9);
 
-                                    // FIX: use correct cache mechanism
                                     toolCallData.set(callId, {
                                         name: part.functionCall.name,
                                         signature: part.thoughtSignature || null
@@ -721,13 +771,10 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                     }
                 });
             } else if (response.candidates && response.candidates.length > 0) {
-                // Non-streaming response - single object
                 const candidate = response.candidates[0];
                 if (candidate.content && candidate.content.parts) {
-                    // Debug: log the raw parts structure
                     console.log('[V1/CHAT] Raw response parts:', JSON.stringify(candidate.content.parts, null, 2).substring(0, 1500));
 
-                    // First try: extract only non-thought text (correct per docs)
                     reply = candidate.content.parts
                         .filter(part => !part.thought && !part.functionCall)
                         .map(part => part.text || '')
@@ -737,7 +784,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                     if (callPart) {
                         const callId = 'call_' + Math.random().toString(36).substr(2, 9);
 
-                        // FIX: use correct cache mechanism
                         toolCallData.set(callId, {
                             name: callPart.functionCall.name,
                             signature: callPart.thoughtSignature || null
@@ -753,7 +799,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                         }];
                     }
 
-                    // Fallback: if empty, extract ALL text (handles multi-turn edge case)
                     if (!reply && !toolCalls) {
                         console.log('[V1/CHAT] Fallback: extracting from all parts including thoughts');
                         reply = candidate.content.parts
@@ -764,7 +809,6 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                     reply = candidate.output;
                 }
             } else if (response.responses && response.responses.length > 0) {
-                // Alternative format
                 response.responses.forEach(r => {
                     if (r.candidates && r.candidates.length > 0) {
                         const part = r.candidates[0]?.content?.parts?.[0]?.text;
@@ -787,7 +831,7 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
                 id: `chatcmpl-${Date.now()}`,
                 object: 'chat.completion',
                 created: Math.floor(Date.now() / 1000),
-                model: requestedModel || model,
+                model: model,
                 choices: [{
                     index: 0,
                     message: {
@@ -827,6 +871,127 @@ router.post('/chat/completions', apiKeyAuth, async (req, res) => {
     }
 });
 
+
+// ============================================================================
+// OPENAI FILE ENDPOINTS (Implementation)
+// ============================================================================
+
+// POST /v1/files - Handles Multipart File Upload
+router.post('/files', upload.single('file'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: { message: "No file provided under body parameter 'file'" } });
+        }
+
+        const fileId = 'file-' + Math.random().toString(36).substr(2, 12);
+        const purpose = req.body.purpose || 'assistants';
+        const fileMetadata = {
+            id: fileId,
+            object: 'file',
+            bytes: req.file.size,
+            created_at: Math.floor(Date.now() / 1000),
+            filename: req.file.originalname,
+            purpose: purpose,
+            mimeType: req.file.mimetype
+        };
+
+        const metaPath = path.join(FILES_DIR, `${fileId}.json`);
+        const dataPath = path.join(FILES_DIR, `${fileId}.data`);
+
+        // Pivot file out of multer temp upload store
+        fs.renameSync(req.file.path, dataPath);
+        fs.writeFileSync(metaPath, JSON.stringify(fileMetadata, null, 2));
+
+        console.log(`[FILES] Streamed file upload completed. ID: ${fileId} (${req.file.originalname})`);
+        res.json(fileMetadata);
+    } catch (e) {
+        console.error('[FILES] Upload error:', e.message);
+        res.status(500).json({ error: { message: e.message } });
+    }
+});
+
+// GET /v1/files - Lists metadata of all uploaded files
+router.get('/files', (req, res) => {
+    try {
+        const fileListing = [];
+        const items = fs.readdirSync(FILES_DIR);
+        for (const item of items) {
+            if (item.endsWith('.json')) {
+                try {
+                    const data = fs.readFileSync(path.join(FILES_DIR, item), 'utf8');
+                    fileListing.push(JSON.parse(data));
+                } catch {}
+            }
+        }
+        res.json({ object: 'list', data: fileListing });
+    } catch (e) {
+        res.status(500).json({ error: { message: e.message } });
+    }
+});
+
+// GET /v1/files/:fileId - Retrieve metadata for a specific file ID
+router.get('/files/:fileId', (req, res) => {
+    try {
+        const { fileId } = req.params;
+        const metaPath = path.join(FILES_DIR, `${fileId}.json`);
+        if (!fs.existsSync(metaPath)) {
+            return res.status(404).json({ error: { message: `File ID ${fileId} not found` } });
+        }
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        res.json(meta);
+    } catch (e) {
+        res.status(500).json({ error: { message: e.message } });
+    }
+});
+
+// GET /v1/files/:fileId/content - Retrieves file binary data stream
+router.get('/files/:fileId/content', (req, res) => {
+    try {
+        const { fileId } = req.params;
+        const metaPath = path.join(FILES_DIR, `${fileId}.json`);
+        const dataPath = path.join(FILES_DIR, `${fileId}.data`);
+
+        if (!fs.existsSync(metaPath) || !fs.existsSync(dataPath)) {
+            return res.status(404).json({ error: { message: `File ID ${fileId} binary download missing` } });
+        }
+
+        const metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        res.setHeader('Content-Type', metadata.mimeType || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${metadata.filename}"`);
+        fs.createReadStream(dataPath).pipe(res);
+    } catch (e) {
+        res.status(500).json({ error: { message: e.message } });
+    }
+});
+
+// DELETE /v1/files/:fileId - Deletes files off disk
+router.delete('/files/:fileId', (req, res) => {
+    try {
+        const { fileId } = req.params;
+        const metaPath = path.join(FILES_DIR, `${fileId}.json`);
+        const dataPath = path.join(FILES_DIR, `${fileId}.data`);
+        let deleted = false;
+
+        if (fs.existsSync(metaPath)) {
+            fs.unlinkSync(metaPath);
+            deleted = true;
+        }
+        if (fs.existsSync(dataPath)) {
+            fs.unlinkSync(dataPath);
+            deleted = true;
+        }
+
+        if (!deleted) {
+            return res.status(404).json({ error: { message: "File ID can't be resolved or is already deleted" } });
+        }
+
+        res.json({ id: fileId, object: 'file', deleted: true });
+    } catch (e) {
+        res.status(500).json({ error: { message: e.message } });
+    }
+});
+
+
 // ============================================================================
 // OPENAI RESPONSES API ENDPOINT: /v1/responses
 // ============================================================================
@@ -858,10 +1023,8 @@ router.post('/responses', async (req, res) => {
     try {
         const { model: requestedModel, instructions, input, tools, temperature = 0.9, max_output_tokens, stream } = req.body;
 
-        // Dynamic Routing
         const model = resolveVertexModel(requestedModel);
 
-        // --- Conversion from Responses API to Chat format ---
         const messages = [];
         if (instructions) messages.push({ role: 'system', content: instructions });
 
@@ -935,7 +1098,6 @@ router.post('/responses', async (req, res) => {
                 safeWrite(res, payload);
             };
 
-            // Handshake (ECHO REQUESTED MODEL)
             sendEvent('response.created', {
                 type: 'response.created',
                 response: {
@@ -980,11 +1142,18 @@ router.post('/responses', async (req, res) => {
 
                     if (tools && Array.isArray(tools) && tools.length > 0) {
                         body.tools = [{
-                            function_declarations: tools.map(t => ({
-                                name: t.function?.name || t.name,
-                                description: t.function?.description || t.description || '',
-                                parameters: sanitizeSchema(t.function?.parameters || t.parameters || { type: 'object', properties: {} })
-                            }))
+                            function_declarations: tools.map(t => {
+                                // FIX: Exclude schema parameters like "strict" from /responses api endpoints
+                                const baseFunc = t.function || t;
+                                const func = {
+                                    name: baseFunc.name,
+                                    description: baseFunc.description || ''
+                                };
+                                if (baseFunc.parameters) {
+                                    func.parameters = sanitizeSchema(baseFunc.parameters);
+                                }
+                                return func;
+                            })
                         }];
                     }
 
@@ -1043,7 +1212,6 @@ router.post('/responses', async (req, res) => {
                                     parts.forEach(p => {
                                         if (p.thought) return;
 
-                                        // Capture thinking signatures (support both snake_case from API and camelCase just in case)
                                         const sig = p.thought_signature || p.thoughtSignature || null;
                                         if (p.text) {
                                             if (!hasStartedText) {
@@ -1128,11 +1296,18 @@ router.post('/responses', async (req, res) => {
 
             if (tools && Array.isArray(tools) && tools.length > 0) {
                 body.tools = [{
-                    function_declarations: tools.map(t => ({
-                        name: t.function?.name || t.name,
-                        description: t.function?.description || t.description || '',
-                        parameters: sanitizeSchema(t.function?.parameters || t.parameters || { type: 'object', properties: {} })
-                    }))
+                    function_declarations: tools.map(t => {
+                        // FIX: Exclude schema parameters like "strict" from /responses api endpoints
+                        const baseFunc = t.function || t;
+                        const func = {
+                            name: baseFunc.name,
+                            description: baseFunc.description || ''
+                        };
+                        if (baseFunc.parameters) {
+                            func.parameters = sanitizeSchema(baseFunc.parameters);
+                        }
+                        return func;
+                    })
                 }];
             }
             const rawResponseObj = await callGeminiAPIWithRetry(body, false, model, "global", req.user?.id);
@@ -1159,7 +1334,6 @@ router.post('/responses', async (req, res) => {
                         const callId = generateId('call_');
                         const funcArgs = JSON.stringify(p.functionCall.args || {});
 
-                        // UNIVERSAL MEMORY: Store the ID with thinking signature
                         toolCallData.set(callId, {
                             name: p.functionCall.name,
                             signature: p.thought_signature || p.thoughtSignature || null
@@ -1193,12 +1367,12 @@ router.post('/responses', async (req, res) => {
 
 router.get('/models', (req, res) => {
     const list = [
-        { id: "gpt-4o", vision: true, reasoning: true },
-        { id: "gpt-4o-mini", vision: true, reasoning: false },
-        { id: "Gemini 3.1 Pro (Vision)", vision: true, reasoning: true },
-        { id: "Gemini 3 Flash", vision: true, reasoning: false },
-        { id: "gemini-1.5-pro-002", vision: true, reasoning: true },
-        { id: "gemini-1.5-flash-002", vision: true, reasoning: false }
+        { id: "Gemini 3.6 Flash", vision: true, reasoning: true },
+        { id: "Gemini 3.5 Flash", vision: true, reasoning: true },
+        { id: "Gemini 3.1 Pro", vision: true, reasoning: true },
+        { id: "Gemini 2.5 Pro", vision: true, reasoning: true },
+        { id: "Gemini 3.5 Flash Lite", vision: true, reasoning: false },
+        { id: "Gemini 2.5 Flash", vision: true, reasoning: false },
     ];
 
     res.json({

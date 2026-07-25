@@ -84,6 +84,38 @@
             </div>
 
         </div>
+
+        <div class="card mb-3">
+
+            <div class="card-header fw-bold">
+                Change Password
+            </div>
+
+            <div class="card-body">
+
+                <div class="row g-2">
+
+                    <div class="col-md-4">
+                        <input id="currentPassword" type="password" class="form-control" placeholder="Current Password">
+                    </div>
+
+                    <div class="col-md-4">
+                        <input id="newPassword" type="password" class="form-control" placeholder="New Password">
+                    </div>
+
+                    <div class="col-md-4">
+                        <button id="changePasswordBtn" class="btn btn-warning w-100">
+                            Change Password
+                        </button>
+                    </div>
+
+                </div>
+
+                <div id="passwordMsg" class="mt-2" style="display:none;"></div>
+
+            </div>
+
+        </div>
         <div class="alert alert-success loading">Loading ...</div>
         <div class="table-responsive">
             <table class="table table-bordered align-middle bg-white">
@@ -221,7 +253,7 @@ function loadKeys(){
 
 <td><span class="badge bg-primary fs-6">${totalTokens.toLocaleString()}</span></td>
 
-<td>${key.last_used_at ? new Date(key.last_used_at).toLocaleString() : 'Never'}</td>
+<td>${key.last_used_at ? new Date(key.last_used_at._seconds ? key.last_used_at._seconds * 1000 : key.last_used_at).toLocaleString() : 'Never'}</td>
 
 <td>
 
@@ -305,6 +337,47 @@ $(document).on("click",".deleteBtn",function(){
 $("#copyBtn").click(function(){
 
     navigator.clipboard.writeText($("#newKey").val());
+
+});
+
+$("#changePasswordBtn").click(function(){
+
+    const currentPassword = $("#currentPassword").val();
+    const newPassword = $("#newPassword").val();
+
+    if (!currentPassword || !newPassword) {
+        $("#passwordMsg")
+            .removeClass("alert-success").addClass("alert alert-danger")
+            .text("Both fields are required.")
+            .show();
+        return;
+    }
+
+    $.ajax({
+        url:'/admin/password',
+        method:'PUT',
+        headers:headers(),
+        contentType:'application/json',
+        data:JSON.stringify({
+            currentPassword: currentPassword,
+            newPassword: newPassword
+        }),
+        success:function(){
+            $("#passwordMsg")
+                .removeClass("alert-danger").addClass("alert alert-success")
+                .text("Password changed successfully.")
+                .show();
+            $("#currentPassword").val("");
+            $("#newPassword").val("");
+        },
+        error:function(xhr){
+            const msg = xhr.responseJSON?.error || "Failed to change password.";
+            $("#passwordMsg")
+                .removeClass("alert-success").addClass("alert alert-danger")
+                .text(msg)
+                .show();
+        }
+    });
 
 });
 
